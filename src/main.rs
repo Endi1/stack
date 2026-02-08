@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fmt;
+use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::str;
 
@@ -22,6 +23,29 @@ fn err(msg: &str) -> Box<dyn Error> {
 }
 
 type StackResult<T> = Result<T, Box<dyn Error>>;
+
+fn prompt(message: &str) -> StackResult<String> {
+    print!("{}", message);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn prompt_multiline(message: &str) -> StackResult<String> {
+    println!("{} (enter empty line to finish):", message);
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        let trimmed = line.trim_end_matches('\n').to_string();
+        if trimmed.is_empty() {
+            break;
+        }
+        lines.push(trimmed);
+    }
+    Ok(lines.join("\n"))
+}
 
 // --- Git Helpers ---
 
@@ -145,14 +169,31 @@ fn cmd_submit() -> StackResult<()> {
     println!("Pushing {}...", current);
     git(&["push", "origin", &current, "--force-with-lease"])?;
 
-    println!("Opening PR against {}...", parent);
-    let _ = run_command(
-        "gh",
-        &[
-            "pr", "create", "--base", &parent, "--head", &current, "--fill",
-        ],
-    )
-    .or_else(|_| run_command("gh", &["pr", "edit", &current, "--base", &parent]));
+    // Check if PR already exists
+    let pr_exists = run_command("gh", &["pr", "view", &current]).is_ok();
+
+    if pr_exists {
+        run_command("gh", &["pr", "edit", &current, "--base", &parent])?;
+        println!("Updated existing PR base to {}", parent);
+    } else {
+        println!("Creating PR against {}...", parent);
+
+        let title = prompt("PR Title: ")?;
+        let body = prompt_multiline("PR Description")?;
+
+        let mut gh_args = vec![
+            "pr", "create", "--base", &parent, "--head", &current, "--title", &title,
+        ];
+
+        if body.is_empty() {
+            gh_args.extend_from_slice(&["--body", ""]);
+        } else {
+            gh_args.extend_from_slice(&["--body", &body])
+        }
+
+        run_command("gh", &gh_args)?;
+        println!("PR created!");
+    }
 
     Ok(())
 }
