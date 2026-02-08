@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fmt;
+use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::str;
 
@@ -22,6 +23,29 @@ fn err(msg: &str) -> Box<dyn Error> {
 }
 
 type StackResult<T> = Result<T, Box<dyn Error>>;
+
+fn prompt(message: &str) -> StackResult<String> {
+    print!("{}", message);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn prompt_multiline(message: &str) -> StackResult<String> {
+    println!("{} (enter empty line to finish):", message);
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        let trimmed = line.trim_end_matches('\n').to_string();
+        if trimmed.is_empty() {
+            break;
+        }
+        lines.push(trimmed);
+    }
+    Ok(lines.join("\n"))
+}
 
 // --- Git Helpers ---
 
@@ -145,14 +169,31 @@ fn cmd_submit() -> StackResult<()> {
     println!("Pushing {}...", current);
     git(&["push", "origin", &current, "--force-with-lease"])?;
 
-    println!("Opening PR against {}...", parent);
-    let _ = run_command(
-        "gh",
-        &[
-            "pr", "create", "--base", &parent, "--head", &current, "--fill",
-        ],
-    )
-    .or_else(|_| run_command("gh", &["pr", "edit", &current, "--base", &parent]));
+    // Check if PR already exists
+    let pr_exists = run_command("gh", &["pr", "view", &current]).is_ok();
+
+    if pr_exists {
+        run_command("gh", &["pr", "edit", &current, "--base", &parent])?;
+        println!("Updated existing PR base to {}", parent);
+    } else {
+        println!("Creating PR against {}...", parent);
+
+        let title = prompt("PR Title: ")?;
+        let body = prompt_multiline("PR Description")?;
+
+        let mut gh_args = vec![
+            "pr", "create", "--base", &parent, "--head", &current, "--title", &title,
+        ];
+
+        if body.is_empty() {
+            gh_args.extend_from_slice(&["--body", ""]);
+        } else {
+            gh_args.extend_from_slice(&["--body", &body])
+        }
+
+        run_command("gh", &gh_args)?;
+        println!("PR created!");
+    }
 
     Ok(())
 }
@@ -175,12 +216,73 @@ fn cmd_amend() -> StackResult<()> {
     cmd_restack()
 }
 
+fn cmd_log() -> StackResult<()> {
+    let current = get_current_branch()?;
+    let child_map = get_child_map()?;
+
+    // Find the root of the stack (walk up parents)
+    let mut root = current.clone();
+    loop {
+        match git(&["config", &format!("branch.{}.stack-parent", root)]) {
+            Ok(parent) => root = parent,
+            Err(_) => break,
+        }
+    }
+
+    // Print the tree starting from root
+    println!();
+    print_tree(&root, &current, &child_map, "", true)?;
+    println!();
+
+    Ok(())
+}
+
+fn print_tree(
+    branch: &str,
+    current: &str,
+    child_map: &HashMap<String, Vec<String>>,
+    prefix: &str,
+    is_last: bool,
+) -> StackResult<()> {
+    let connector = if prefix.is_empty() {
+        ""
+    } else if is_last {
+        "└── "
+    } else {
+        "├── "
+    };
+    let marker = if branch == current { " ◀" } else { "" };
+
+    // Get short commit info
+    let commit_info = git(&["log", "-1", "--format=%h %s", branch]).unwrap_or_default();
+
+    println!("{}{}{}{}", prefix, connector, branch, marker);
+    println!("{}    {}", prefix, commit_info);
+
+    if let Some(children) = child_map.get(branch) {
+        let new_prefix = if prefix.is_empty() {
+            "".to_string()
+        } else if is_last {
+            format!("{}    ", prefix)
+        } else {
+            format!("{}│   ", prefix)
+        };
+
+        for (i, child) in children.iter().enumerate() {
+            let child_is_last = i == children.len() - 1;
+            print_tree(child, current, child_map, &new_prefix, child_is_last)?;
+        }
+    }
+
+    Ok(())
+}
+
 // --- Main ---
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: stack <new|switch|submit|restack|amend>");
+        eprintln!("Usage: stack <new|switch|submit|restack|amend|log>");
         std::process::exit(1);
     }
 
@@ -193,6 +295,7 @@ fn main() {
         "submit" => cmd_submit(),
         "restack" => cmd_restack(),
         "amend" => cmd_amend(),
+        "log" => cmd_log(),
         _ => Err(err(&format!("Unknown command: {}", command))),
     };
 
