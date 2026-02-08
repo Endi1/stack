@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fmt;
+use std::fs;
+use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::str;
 
@@ -22,6 +24,29 @@ fn err(msg: &str) -> Box<dyn Error> {
 }
 
 type StackResult<T> = Result<T, Box<dyn Error>>;
+
+fn prompt(message: &str) -> StackResult<String> {
+    print!("{}", message);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn prompt_multiline(message: &str) -> StackResult<String> {
+    println!("{} (enter empty line to finish):", message);
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        let trimmed = line.trim_end_matches('\n').to_string();
+        if trimmed.is_empty() {
+            break;
+        }
+        lines.push(trimmed);
+    }
+    Ok(lines.join("\n"))
+}
 
 // --- Git Helpers ---
 
@@ -137,6 +162,43 @@ fn cmd_switch(args: &[String]) -> StackResult<()> {
     git_passthrough(&["checkout", name])
 }
 
+fn get_body_from_editor() -> StackResult<String> {
+    let editor = env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let tmp = "/tmp/stack-pr-body.md";
+
+    // Create file with helpful template
+    fs::write(
+        tmp,
+        "\n# Enter PR description above (lines starting with # are ignored)\n",
+    )?;
+
+    let status = Command::new(&editor)
+        .arg(tmp)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+
+    if !status.success() {
+        return Err(err("Editor exited with error"));
+    }
+
+    let content = fs::read_to_string(tmp)?;
+
+    // Filter out comment lines
+    let body: String = content
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+
+    fs::remove_file(tmp).ok();
+
+    Ok(body)
+}
+
 fn cmd_submit() -> StackResult<()> {
     let current = get_current_branch()?;
     let parent = git(&["config", &format!("branch.{}.stack-parent", current)])
@@ -145,14 +207,30 @@ fn cmd_submit() -> StackResult<()> {
     println!("Pushing {}...", current);
     git(&["push", "origin", &current, "--force-with-lease"])?;
 
-    println!("Opening PR against {}...", parent);
-    let _ = run_command(
-        "gh",
-        &[
-            "pr", "create", "--base", &parent, "--head", &current, "--fill",
-        ],
-    )
-    .or_else(|_| run_command("gh", &["pr", "edit", &current, "--base", &parent]));
+    let pr_exists = run_command("gh", &["pr", "view", &current]).is_ok();
+
+    if pr_exists {
+        run_command("gh", &["pr", "edit", &current, "--base", &parent])?;
+        println!("Updated existing PR base to {}", parent);
+    } else {
+        println!("Creating PR against {}...", parent);
+
+        let title = prompt("PR Title: ")?;
+        let body = get_body_from_editor()?;
+
+        let mut gh_args = vec![
+            "pr", "create", "--base", &parent, "--head", &current, "--title", &title,
+        ];
+
+        if body.is_empty() {
+            gh_args.extend_from_slice(&["--body", ""]);
+        } else {
+            gh_args.extend_from_slice(&["--body", &body]);
+        }
+
+        run_command("gh", &gh_args)?;
+        println!("PR created!");
+    }
 
     Ok(())
 }
