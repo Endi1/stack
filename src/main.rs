@@ -277,12 +277,89 @@ fn print_tree(
     Ok(())
 }
 
+fn cmd_land() -> StackResult<()> {
+    let current = get_current_branch()?;
+
+    // Build the stack from current back to main
+    let mut stack = vec![current.clone()];
+    let mut branch = current.clone();
+
+    loop {
+        match git(&["config", &format!("branch.{}.stack-parent", branch)]) {
+            Ok(parent) => {
+                if parent == "main" {
+                    break;
+                }
+                // Only add if branch actually exists
+                if branch_exists(&parent)? {
+                    stack.push(parent.clone());
+                }
+                branch = parent;
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Reverse so we merge bottom-up (closest to main first)
+    stack.reverse();
+
+    if stack.is_empty() {
+        return Err(err("Nothing to land"));
+    }
+
+    println!("Will land the following branches into main:");
+    for b in &stack {
+        println!("  - {}", b);
+    }
+
+    let confirm = prompt("Proceed? [y/N] ")?;
+    if confirm.to_lowercase() != "y" {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // Switch to main and pull latest
+    git(&["checkout", "main"])?;
+    git(&["pull", "origin", "main"])?;
+
+    for branch in &stack {
+        println!("Merging {}...", branch);
+
+        // Merge with squash or regular merge - using squash for clean history
+        git(&["merge", "--squash", branch])?;
+
+        // Get the original commit message
+        let msg = git(&["log", "-1", "--format=%B", branch])?;
+        git(&["commit", "-m", &msg])?;
+
+        // Delete the branch locally and remotely
+        git(&["branch", "-D", branch])?;
+        let _ = git(&["push", "origin", "--delete", branch]); // Ignore if remote doesn't exist
+
+        // Clean up the stack-parent config
+        let _ = git(&[
+            "config",
+            "--unset",
+            &format!("branch.{}.stack-parent", branch),
+        ]);
+    }
+
+    println!("Pushing main...");
+    git(&["push", "origin", "main"])?;
+
+    println!("Done! Landed {} branch(es).", stack.len());
+    Ok(())
+}
+
+fn branch_exists(name: &str) -> StackResult<bool> {
+    Ok(git(&["rev-parse", "--verify", name]).is_ok())
+}
 // --- Main ---
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: stack <new|switch|submit|restack|amend|log>");
+        eprintln!("Usage: stack <new|switch|submit|restack|amend|log|land>");
         std::process::exit(1);
     }
 
@@ -296,6 +373,7 @@ fn main() {
         "restack" => cmd_restack(),
         "amend" => cmd_amend(),
         "log" => cmd_log(),
+        "land" => cmd_land(),
         _ => Err(err(&format!("Unknown command: {}", command))),
     };
 
